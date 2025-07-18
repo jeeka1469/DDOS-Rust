@@ -1,0 +1,1 @@
+{"rustc":1842507548689473721,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[1137001119912760293,"build_script_build",false,2204283984116906180]],"local":[{"RerunIfChanged":{"output":"debug\\build\\ddos_ai-320384d8e91ff624\\output","paths":["build.rs"]}}],"rustflags":[],"config":0,"compile_kind":0}

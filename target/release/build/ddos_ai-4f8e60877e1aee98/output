@@ -1,0 +1,4 @@
+cargo:rustc-link-search=native=C:\Npcap-SDK\Lib\x64
+cargo:rustc-link-lib=static=Packet
+cargo:rustc-link-lib=dylib=wpcap
+cargo:rerun-if-changed=build.rs

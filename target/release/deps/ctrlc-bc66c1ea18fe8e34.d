@@ -1,0 +1,11 @@
+C:\Users\jeeka\DDOS_AI_RUST\ddos_ai\target\release\deps\ctrlc-bc66c1ea18fe8e34.d: C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\lib.rs C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\error.rs C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\platform\mod.rs C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\platform\windows\mod.rs C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\signal.rs
+
+C:\Users\jeeka\DDOS_AI_RUST\ddos_ai\target\release\deps\libctrlc-bc66c1ea18fe8e34.rlib: C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\lib.rs C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\error.rs C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\platform\mod.rs C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\platform\windows\mod.rs C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\signal.rs
+
+C:\Users\jeeka\DDOS_AI_RUST\ddos_ai\target\release\deps\libctrlc-bc66c1ea18fe8e34.rmeta: C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\lib.rs C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\error.rs C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\platform\mod.rs C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\platform\windows\mod.rs C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\signal.rs
+
+C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\lib.rs:
+C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\error.rs:
+C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\platform\mod.rs:
+C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\platform\windows\mod.rs:
+C:\Users\jeeka\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctrlc-3.4.7\src\signal.rs:
