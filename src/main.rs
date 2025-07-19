@@ -16,7 +16,14 @@ use csv;
 use lazy_static::lazy_static;
 
 mod model_predictor;
+mod ddos_detector;
 use model_predictor::ModelPredictor;
+use ddos_detector::DDoSDetector;
+
+// Create a global DDoS detector
+lazy_static! {
+    static ref DDOS_DETECTOR: Mutex<DDoSDetector> = Mutex::new(DDoSDetector::new(60, 100)); // 100 requests per minute threshold
+}
 
 // --- Feature Struct (ALL 84+ fields) ---
 #[derive(Debug, Serialize, Default, Clone)]
@@ -26,7 +33,7 @@ pub struct FlowFeatures {
     pub dst_ip: String,
     pub src_port: u16,
     pub dst_port: u16,
-    pub protocol: String,
+    pub protocol: i64,
     pub timestamp: String,
 
     // Flow stats
@@ -130,7 +137,7 @@ struct FlowTracker {
     dst_ip: IpAddr,
     src_port: u16,
     dst_port: u16,
-    protocol: String,
+    protocol: i64,
     last_prediction: Option<(String, f64)>,
     prediction_count: u32,
 }
@@ -178,10 +185,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // List all available interfaces
     let interfaces = datalink::interfaces();
+    println!("\n==============================");
     println!("Available Network Interfaces:");
+    println!("==============================");
     for (i, iface) in interfaces.iter().enumerate() {
-        print!("[{}] {} - IPs: ", i, iface.name);
-        
         let ips: Vec<String> = iface.ips.iter()
             .filter_map(|ip_network| {
                 if let IpAddr::V4(ipv4) = ip_network.ip() {
@@ -191,55 +198,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             })
             .collect();
-        if ips.is_empty() {
-            println!("No IPv4 assigned");
-        } else {
-            println!("{}", ips.join(", "));
-        }
+        println!("[{}] {} - IPs: {}", i, iface.name, if ips.is_empty() { "No IPv4 assigned".to_string() } else { ips.join(", ") });
     }
-
-    // Ask user to select interface index
+    println!("\nTip: Choose the interface with the IP matching your server (e.g., 192.168.x.x). Run as administrator for best results.");
     print!("Enter interface index to capture on: ");
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let index: usize = input.trim().parse().expect("Please enter a valid number");
-
     if index >= interfaces.len() {
-        panic!("Invalid interface index");
+        eprintln!("Invalid interface index. Exiting.");
+        return Err("Invalid interface index".into());
     }
     let interface = &interfaces[index];
-
+    let iface_ips: Vec<String> = interface.ips.iter()
+        .filter_map(|ip_network| {
+            if let IpAddr::V4(ipv4) = ip_network.ip() {
+                Some(ipv4.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
     println!("Selected interface: {}", interface.name);
+    println!("Interface IPs: {}", if iface_ips.is_empty() { "No IPv4 assigned".to_string() } else { iface_ips.join(", ") });
+    if iface_ips.is_empty() {
+        println!("Warning: Selected interface has no IPv4 address. You may not capture expected traffic.");
+    }
 
-    // Open channel for capturing packets
-    let (_, mut rx) = match datalink::channel(interface, Default::default()) {
+    // Open channel for capturing packets (enable promiscuous mode)
+    let mut config = datalink::Config::default();
+    config.promiscuous = true;
+    let (_, mut rx) = match datalink::channel(interface, config) {
         Ok(Ethernet(_, rx)) => ((), rx),
-        _ => panic!("Failed to open channel"),
+        Err(e) => {
+            eprintln!("Failed to open channel: {}", e);
+            eprintln!("Try running as administrator or selecting a different interface.");
+            return Err(Box::new(e));
+        }
+        _ => {
+            eprintln!("Failed to open channel: Unknown error");
+            return Err("Failed to open channel".into());
+        }
     };
-
-    println!("Capturing on {}... Press Ctrl+C to stop", interface.name);
-    println!("Real-time DDoS detection enabled!");
+    println!("\nCapturing on {}... Press Ctrl+C to stop", interface.name);
+    println!("Real-time DDoS detection enabled!\n");
 
     // Initialize CSV writer
     let mut writer = csv::Writer::from_path("flow_features_with_predictions.csv")?;
     let mut packet_count = 0;
 
+    let mut last_packet_time = std::time::Instant::now();
     while running.load(Ordering::SeqCst) {
         match rx.next() {
             Ok(packet) => {
+                last_packet_time = std::time::Instant::now();
                 if !running.load(Ordering::SeqCst) {
                     println!("\nShutting down gracefully...");
                     break;
                 }
                 packet_count += 1;
-                // Process every 5th packet to avoid overwhelming output
-                if packet_count % 5 == 0 {
-                    println!("Processed {} packets...", packet_count);
-                }
-
                 if let Some(ipv4) = Ipv4Packet::new(packet) {
+                    let src_ip = ipv4.get_source();
+                    let dst_ip = ipv4.get_destination();
                     let protocol_num = ipv4.get_next_level_protocol();
+                    let proto_str = format!("{}", protocol_num);
+                    let src_ip_str = src_ip.to_string();
+                    let dst_ip_str = dst_ip.to_string();
+                    println!("[Packet {}] Protocol: {} | Src: {} | Dst: {}", packet_count, proto_str, src_ip_str, dst_ip_str);
                     match protocol_num {
                         IpNextHeaderProtocols::Tcp => {
                             if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
@@ -256,14 +282,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                if packet_count % 5 == 0 {
+                    println!("Processed {} packets...", packet_count);
+                }
             }
             Err(e) => {
                 eprintln!("Error reading packet: {}", e);
+                if last_packet_time.elapsed().as_secs() > 10 {
+                    println!("Warning: No packets captured in the last 10 seconds. Check interface selection and permissions.");
+                    last_packet_time = std::time::Instant::now();
+                }
                 continue;
             }
         }
     }
-    println!("Capture stopped. Exiting.");
+    println!("\nCapture stopped. Exiting.");
     Ok(())
 }
 
@@ -277,10 +310,9 @@ fn process_tcp_packet(
     let dst_ip = ipv4.get_destination();
     let src_port = tcp.get_source();
     let dst_port = tcp.get_destination();
-    let protocol = "TCP";
-    
-    let flow_key = format!("{}:{}-{}:{}-{}", src_ip, src_port, dst_ip, dst_port, protocol);
-    let reverse_key = format!("{}:{}-{}:{}-{}", dst_ip, dst_port, src_ip, src_port, protocol);
+    let protocol_num = 6;  // TCP is protocol 6
+    let flow_key = format!("{}:{}-{}:{}-{}", src_ip, src_port, dst_ip, dst_port, protocol_num);
+    let reverse_key = format!("{}:{}-{}:{}-{}", dst_ip, dst_port, src_ip, src_port, protocol_num);
     
     let mut flow_table = FLOW_TABLE.lock().unwrap();
     
@@ -305,7 +337,7 @@ fn process_tcp_packet(
         dst_ip: IpAddr::V4(dst_ip),
         src_port,
         dst_port,
-        protocol: protocol.to_string(),
+        protocol: protocol_num,
         last_prediction: None,
         prediction_count: 0,
     });
@@ -336,9 +368,42 @@ fn process_tcp_packet(
 
     // Calculate features
     let mut features = calculate_features(&flow);
+    
+    // Save original IPs
+    let orig_src_ip = features.src_ip.clone();
+    let orig_dst_ip = features.dst_ip.clone();
+
     // Encode categorical features before prediction
     if let Err(e) = model_predictor::apply_label_encoders(&mut features, "unified_ddos_best_model_metadata.pkl") {
         eprintln!("Label encoding error: {}", e);
+    }
+
+    // Get prediction
+    if let Ok(predictor_guard) = MODEL_PREDICTOR.lock() {
+        if let Some(predictor) = predictor_guard.as_ref() {
+            match predictor.predict(&features) {
+                Ok((attack_type, confidence)) => {
+                    // Print prediction with color
+                    let prediction_color = if attack_type != "BENIGN" { "\x1b[31m" } else { "\x1b[32m" };
+                    println!("\n\x1b[36m=== Packet Analysis ===\x1b[0m");
+                    println!("Source IP: \x1b[33m{}\x1b[0m", orig_src_ip);
+                    println!("Destination IP: \x1b[33m{}\x1b[0m", orig_dst_ip);
+                    println!("Protocol: \x1b[33m{}\x1b[0m", features.protocol);
+                    println!("Prediction: {}{}\\x1b[0m (Confidence: {:.2}%)", 
+                             prediction_color, attack_type, confidence * 100.0);
+
+                    // Check for potential DDoS if it's an attack
+                    if attack_type != "BENIGN" {
+                        if let Some(alert) = DDOS_DETECTOR.lock().unwrap().check_ip(&orig_src_ip, &attack_type) {
+                            println!("\n{}\n", alert);
+                        }
+                    }
+                    
+                    println!("\x1b[36m{}\x1b[0m", "-".repeat(50));
+                }
+                Err(e) => eprintln!("Prediction error: {}", e),
+            }
+        }
     }
 
     // Make prediction every 10 packets or if it's a new flow
@@ -347,14 +412,9 @@ fn process_tcp_packet(
         if let Some(ref predictor) = *MODEL_PREDICTOR.lock().unwrap() {
             match predictor.predict(&features) {
                 Ok((prediction, confidence)) => {
-                    // Save original IPs for reporting
-                    let orig_src_ip = features.src_ip.clone();
-                    let orig_dst_ip = features.dst_ip.clone();
-                    
                     features.label = prediction.clone();
                     flow.last_prediction = Some((prediction.clone(), confidence));
                     flow.prediction_count += 1;
-                    
                     // Alert for potential DDoS
                     if prediction.to_lowercase().contains("ddos") || 
                        prediction.to_lowercase().contains("attack") {
@@ -378,7 +438,9 @@ fn process_tcp_packet(
         features.label = last_pred.clone();
     }
 
-    // Write features to CSV
+    // Restore original IPs before saving to CSV
+    features.src_ip = orig_src_ip;
+    features.dst_ip = orig_dst_ip;
     writer.serialize(&features)?;
     writer.flush()?;
 
@@ -404,10 +466,9 @@ fn process_udp_packet(
     let dst_ip = ipv4.get_destination();
     let src_port = udp.get_source();
     let dst_port = udp.get_destination();
-    let protocol = "UDP";
-    
-    let flow_key = format!("{}:{}-{}:{}-{}", src_ip, src_port, dst_ip, dst_port, protocol);
-    let reverse_key = format!("{}:{}-{}:{}-{}", dst_ip, dst_port, src_ip, src_port, protocol);
+    let protocol_num = 17;  // UDP is protocol 17
+    let flow_key = format!("{}:{}-{}:{}-{}", src_ip, src_port, dst_ip, dst_port, protocol_num);
+    let reverse_key = format!("{}:{}-{}:{}-{}", dst_ip, dst_port, src_ip, src_port, protocol_num);
     
     let mut flow_table = FLOW_TABLE.lock().unwrap();
     
@@ -431,7 +492,7 @@ fn process_udp_packet(
         dst_ip: IpAddr::V4(dst_ip),
         src_port,
         dst_port,
-        protocol: protocol.to_string(),
+        protocol: protocol_num,
         last_prediction: None,
         prediction_count: 0,
     });
@@ -456,6 +517,9 @@ fn process_udp_packet(
 
     // Calculate features and make prediction
     let mut features = calculate_features(&flow);
+    let orig_src_ip = features.src_ip.clone();
+    let orig_dst_ip = features.dst_ip.clone();
+
     // Encode categorical features before prediction
     if let Err(e) = model_predictor::apply_label_encoders(&mut features, "unified_ddos_best_model_metadata.pkl") {
         eprintln!("Label encoding error: {}", e);
@@ -464,16 +528,11 @@ fn process_udp_packet(
     let total_packets = flow.fwd_packets.len() + flow.bwd_packets.len();
     if total_packets % 15 == 0 || flow.last_prediction.is_none() {
         if let Some(ref predictor) = *MODEL_PREDICTOR.lock().unwrap() {
-            match predictor.predict(&features) {
+            match predictor.predict(&mut features) {
                 Ok((prediction, confidence)) => {
-                    // Save original IPs for reporting
-                    let orig_src_ip = features.src_ip.clone();
-                    let orig_dst_ip = features.dst_ip.clone();
-                    
                     features.label = prediction.clone();
                     flow.last_prediction = Some((prediction.clone(), confidence));
                     flow.prediction_count += 1;
-                    
                     // Alert for potential DDoS
                     if prediction.to_lowercase().contains("ddos") || 
                        prediction.to_lowercase().contains("attack") {
@@ -495,7 +554,9 @@ fn process_udp_packet(
         features.label = last_pred.clone();
     }
 
-    // Write features to CSV
+    // Restore original IPs before saving to CSV
+    features.src_ip = orig_src_ip;
+    features.dst_ip = orig_dst_ip;
     writer.serialize(&features)?;
     writer.flush()?;
 
@@ -519,10 +580,9 @@ fn process_generic_packet(
     let now = SystemTime::now();
     let src_ip = ipv4.get_source();
     let dst_ip = ipv4.get_destination();
-    let protocol_name = format!("{:?}", protocol);
-    
-    let flow_key = format!("{}:0-{}:0-{}", src_ip, dst_ip, protocol_name);
-    let reverse_key = format!("{}:0-{}:0-{}", dst_ip, src_ip, protocol_name);
+    let protocol_num = protocol.0 as i64;  // Extract the raw protocol number
+    let flow_key = format!("{}:0-{}:0-{}", src_ip, dst_ip, protocol_num);
+    let reverse_key = format!("{}:0-{}:0-{}", dst_ip, src_ip, protocol_num);
     
     let mut flow_table = FLOW_TABLE.lock().unwrap();
     
@@ -546,7 +606,7 @@ fn process_generic_packet(
         dst_ip: IpAddr::V4(dst_ip),
         src_port: 0,
         dst_port: 0,
-        protocol: protocol_name.clone(),
+        protocol: protocol_num,
         last_prediction: None,
         prediction_count: 0,
     });
@@ -571,6 +631,12 @@ fn process_generic_packet(
 
     // Calculate features and make prediction
     let mut features = calculate_features(&flow);
+    let orig_src_ip = features.src_ip.clone();
+    let orig_dst_ip = features.dst_ip.clone();
+
+    // Debug: Print generic packet info
+    println!("[Generic] Protocol: {} | Src: {} | Dst: {} | Total packets: {}", features.protocol, orig_src_ip, orig_dst_ip, flow.fwd_packets.len() + flow.bwd_packets.len());
+
     // Encode categorical features before prediction
     if let Err(e) = model_predictor::apply_label_encoders(&mut features, "unified_ddos_best_model_metadata.pkl") {
         eprintln!("Label encoding error: {}", e);
@@ -579,16 +645,12 @@ fn process_generic_packet(
     let total_packets = flow.fwd_packets.len() + flow.bwd_packets.len();
     if total_packets % 20 == 0 || flow.last_prediction.is_none() {
         if let Some(ref predictor) = *MODEL_PREDICTOR.lock().unwrap() {
-            match predictor.predict(&features) {
+            match predictor.predict(&mut features) {
                 Ok((prediction, confidence)) => {
-                    // Save original IPs for reporting
-                    let orig_src_ip = features.src_ip.clone();
-                    let orig_dst_ip = features.dst_ip.clone();
-                    
                     features.label = prediction.clone();
                     flow.last_prediction = Some((prediction.clone(), confidence));
                     flow.prediction_count += 1;
-                    
+                    println!("[Prediction] Label: {} | Confidence: {:.2}%", prediction, confidence * 100.0);
                     // Alert for potential DDoS
                     if prediction.to_lowercase().contains("ddos") || 
                        prediction.to_lowercase().contains("attack") {
@@ -609,7 +671,9 @@ fn process_generic_packet(
         features.label = last_pred.clone();
     }
 
-    // Write features to CSV
+    // Restore original IPs before saving to CSV
+    features.src_ip = orig_src_ip;
+    features.dst_ip = orig_dst_ip;
     writer.serialize(&features)?;
     writer.flush()?;
 
@@ -624,7 +688,7 @@ fn calculate_features(flow: &FlowTracker) -> FlowFeatures {
     features.dst_ip = flow.dst_ip.to_string();
     features.src_port = flow.src_port;
     features.dst_port = flow.dst_port;
-    features.protocol = flow.protocol.clone();
+    features.protocol = flow.protocol;
     features.timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
     
     // Basic packet counts
@@ -696,7 +760,7 @@ fn calculate_features(flow: &FlowTracker) -> FlowFeatures {
     calculate_iat_features(&flow.fwd_packets, &flow.bwd_packets, &mut features);
     
     // Calculate TCP flags if applicable
-    if flow.protocol == "TCP" {
+    if flow.protocol == 6 {
         calculate_tcp_flags(&flow.fwd_packets, &flow.bwd_packets, &mut features);
     }
     

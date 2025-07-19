@@ -47,6 +47,12 @@ impl ModelPredictor {
             // Ensure columns match training data
             use pyo3::types::IntoPyDict;
             let kwargs = [("columns", self.feature_columns.clone())].into_py_dict(py)?;
+            
+            // Print real-time packet info
+            println!("\n\x1b[36m=== New Packet Detected ===\x1b[0m");
+            println!("Source IP: \x1b[33m{}\x1b[0m", features.src_ip);
+            println!("Destination IP: \x1b[33m{}\x1b[0m", features.dst_ip);
+            println!("Protocol: \x1b[33m{}\x1b[0m", features.protocol);
             let df = df.call_method("reindex", (), Some(&kwargs))?;
             
             // Scale features
@@ -122,8 +128,7 @@ impl ModelPredictor {
             dict.set_item("init_bwd_win_byts", features.init_bwd_win_byts)?;
             
             // Handle categorical features (IP addresses, protocol)
-            // These need to be encoded the same way as during training
-            dict.set_item("protocol", features.protocol.clone())?;
+            dict.set_item("protocol", features.protocol)?;
             dict.set_item("src_ip", features.src_ip.clone())?;
             dict.set_item("dst_ip", features.dst_ip.clone())?;
             dict.set_item("src_port", features.src_port)?;
@@ -144,19 +149,8 @@ pub fn apply_label_encoders(features: &mut FlowFeatures, metadata_path: &str) ->
             .extract()?;
         
         // Apply encoders to categorical features
-        if let Some(protocol_encoder) = label_encoders.get("protocol") {
-            let encoded = protocol_encoder.call_method1(py, "transform", ([&features.protocol],));
-            match encoded {
-                Ok(val) => {
-                    let arr: Vec<i64> = val.extract(py)?;
-                    let val = arr.get(0).copied().unwrap_or(-1);
-                    features.protocol = val.to_string();
-                },
-                Err(_) => {
-                    features.protocol = "-1".to_string();
-                }
-            }
-        }
+        // Protocol is already a number (e.g., 6 for TCP, 17 for UDP)
+        // No need to encode it as it's already in the correct format
         if let Some(src_ip_encoder) = label_encoders.get("src_ip") {
             let encoded = src_ip_encoder.call_method1(py, "transform", ([&features.src_ip],));
             match encoded {
@@ -184,10 +178,8 @@ pub fn apply_label_encoders(features: &mut FlowFeatures, metadata_path: &str) ->
             }
         }
 
-        // Enforce integer encoding for protocol, src_ip, dst_ip
-        if features.protocol.parse::<i64>().is_err() {
-            features.protocol = "-1".to_string();
-        }
+        // Enforce integer encoding for src_ip, dst_ip
+        // Protocol is already i64, no need to parse
         if features.src_ip.parse::<i64>().is_err() {
             features.src_ip = "-1".to_string();
         }
