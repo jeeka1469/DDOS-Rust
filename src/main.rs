@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Mutex;
-use std::time::{SystemTime, Duration};
+use std::time::SystemTime;
 use std::io::{self, Write};
 
 use pnet::datalink::{self, Channel::Ethernet};
@@ -11,7 +11,6 @@ use pnet::packet::tcp::TcpPacket;
 use pnet::packet::udp::UdpPacket;
 
 use serde::Serialize;
-use chrono::{DateTime, Local};
 use csv;
 use lazy_static::lazy_static;
 
@@ -220,24 +219,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         .collect();
-    println!("Selected interface: {}", interface.name);
-    println!("Interface IPs: {}", if iface_ips.is_empty() { "No IPv4 assigned".to_string() } else { iface_ips.join(", ") });
+    println!("\n[Interface Verification]");
+    println!("├─ Selected: {}", interface.name);
+    println!("├─ MAC Address: {}", interface.mac.map_or("Unknown".to_string(), |mac| mac.to_string()));
+    // MTU not available
+    println!("├─ Interface Type: {}", if !iface_ips.is_empty() { "Active" } else { "Inactive" });
+    println!("├─ Flags: {}", interface.flags);
+    println!("└─ IPv4 Addresses: {}", if iface_ips.is_empty() { "None assigned".to_string() } else { iface_ips.join(", ") });
+
+    // Interface capability verification
     if iface_ips.is_empty() {
-        println!("Warning: Selected interface has no IPv4 address. You may not capture expected traffic.");
+        println!("\n[!] Warning: Interface has no IPv4 address");
+        println!("    - Traffic capture may be limited");
+        println!("    - Consider using an interface with an IP address");
+    }
+    
+    // Check interface status and capabilities
+    println!("\n[Interface Capability Check]");
+    println!("├─ Link Status: {}", if !iface_ips.is_empty() { "✓ UP" } else { "⨯ DOWN" });
+    println!("├─ Broadcast: {}", if interface.is_broadcast() { "✓ Supported" } else { "⨯ Not supported" });
+    println!("├─ Multicast: {}", if interface.is_multicast() { "✓ Supported" } else { "⨯ Not supported" });
+    println!("├─ Point-to-Point: {}", if interface.is_point_to_point() { "✓ Yes" } else { "⨯ No" });
+    println!("└─ Loopback: {}", if interface.is_loopback() { "✓ Yes" } else { "⨯ No" });
+
+    // Verify interface is ready for capture
+    if iface_ips.is_empty() {
+        println!("\n[!] Critical: Interface does not have an IPv4 address");
+        println!("    - No traffic can be captured without a valid IPv4 address");
+        println!("    - Ensure interface is connected and has a valid IP");
+        println!("    - Common solutions:");
+        println!("      1. Check network connection");
+        println!("      2. Verify DHCP is working");
+        println!("      3. Configure a static IP");
+        println!("      4. Select a different interface");
+        return Err("Interface has no IPv4 address".into());
     }
 
-    // Open channel for capturing packets (enable promiscuous mode)
+    // Additional warnings based on interface type
+    if interface.is_loopback() {
+        println!("\n[!] Notice: Loopback interface selected");
+        println!("    - Will only capture local traffic");
+        println!("    - For network traffic, select a network interface");
+    }
+    
+    // Enhanced network interface configuration
+    println!("\n[*] Configuring network interface for maximum packet capture...");
     let mut config = datalink::Config::default();
-    config.promiscuous = true;
+    config.promiscuous = true;  // Enable promiscuous mode
+    config.read_timeout = Some(std::time::Duration::from_millis(1));  // Fast read timeout
+    config.write_timeout = Some(std::time::Duration::from_millis(1)); // Fast write timeout
+    config.read_buffer_size = 16777216;  // 16MB read buffer
+    config.write_buffer_size = 16777216; // 16MB write buffer
+
+    println!("[+] Interface settings:");
+    println!("    - Promiscuous mode: Enabled");
+    println!("    - Buffer size: 16MB");
+    println!("    - Read timeout: 1ms");
+    // MTU not available
+
     let (_, mut rx) = match datalink::channel(interface, config) {
-        Ok(Ethernet(_, rx)) => ((), rx),
+        Ok(Ethernet(_, rx)) => {
+            println!("[+] Successfully opened network channel in promiscuous mode");
+            ((), rx)
+        },
         Err(e) => {
-            eprintln!("Failed to open channel: {}", e);
-            eprintln!("Try running as administrator or selecting a different interface.");
+            eprintln!("\n[!] Failed to open channel: {}", e);
+            eprintln!("[!] Common solutions:");
+            eprintln!("    1. Run as administrator/root");
+            eprintln!("    2. Check interface permissions");
+            eprintln!("    3. Verify WinPcap/Npcap installation");
+            eprintln!("    4. Try a different interface");
             return Err(Box::new(e));
         }
         _ => {
-            eprintln!("Failed to open channel: Unknown error");
+            eprintln!("\n[!] Failed to open channel: Unknown error");
             return Err("Failed to open channel".into());
         }
     };
@@ -249,23 +304,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut packet_count = 0;
 
     let mut last_packet_time = std::time::Instant::now();
+    let mut last_stats_time = std::time::Instant::now();
+    let mut packets_since_last_stats = 0;
+    let mut dropped_packets = 0;
+    
+    // Detailed packet statistics
+    let mut protocol_stats = std::collections::HashMap::new();
+    let mut size_distribution = std::collections::HashMap::new();
+    let mut packets_per_second = Vec::new();
+    let mut max_packet_rate = 0.0;
+    let mut min_packet_rate = f64::MAX;
+    let mut total_bytes = 0u64;
+    
+    // Health monitoring
+    let mut capture_health = 100.0;
+    
+    println!("\n[*] Starting packet capture...");
+    println!("[*] Packet processing statistics will be shown every 5 seconds");
+    
     while running.load(Ordering::SeqCst) {
         match rx.next() {
             Ok(packet) => {
                 last_packet_time = std::time::Instant::now();
                 if !running.load(Ordering::SeqCst) {
-                    println!("\nShutting down gracefully...");
+                    println!("\n[*] Shutting down gracefully...");
                     break;
                 }
+                
                 packet_count += 1;
+                packets_since_last_stats += 1;
+
+                // Process packet
                 if let Some(ipv4) = Ipv4Packet::new(packet) {
                     let src_ip = ipv4.get_source();
                     let dst_ip = ipv4.get_destination();
                     let protocol_num = ipv4.get_next_level_protocol();
-                    let proto_str = format!("{}", protocol_num);
-                    let src_ip_str = src_ip.to_string();
-                    let dst_ip_str = dst_ip.to_string();
-                    println!("[Packet {}] Protocol: {} | Src: {} | Dst: {}", packet_count, proto_str, src_ip_str, dst_ip_str);
+                    let packet_size = packet.len();
+                    total_bytes += packet_size as u64;
+                    
+                    // Protocol name lookup and statistics
+                    let proto_name = match protocol_num.0 {
+                        1 => "ICMP",
+                        6 => "TCP",
+                        17 => "UDP",
+                        47 => "GRE",
+                        50 => "ESP",
+                        51 => "AH",
+                        58 => "ICMPv6",
+                        _ => "Unknown"
+                    };
+                    
+                    // Update protocol statistics
+                    *protocol_stats.entry(proto_name.to_string()).or_insert(0) += 1;
+                    
+                    // Update size distribution
+                    let size_category = match packet_size {
+                        0..=64 => "Tiny (0-64)",
+                        65..=256 => "Small (65-256)",
+                        257..=1024 => "Medium (257-1024)",
+                        1025..=1500 => "Large (1025-1500)",
+                        _ => "Jumbo (1500+)"
+                    };
+                    *size_distribution.entry(size_category.to_string()).or_insert(0) += 1;
+
+                    // Packet verification
+                    let packet_valid = verify_packet(&ipv4);
+                    if !packet_valid {
+                        dropped_packets += 1;
+                        capture_health -= 0.1;
+                        capture_health = f64::max(capture_health, 0.0);
+                    }
+
+                    // Colored output based on protocol
+                    let color_code = match proto_name {
+                        "TCP" => "\x1b[36m",   // Cyan
+                        "UDP" => "\x1b[32m",   // Green
+                        "ICMP" => "\x1b[33m",  // Yellow
+                        _ => "\x1b[37m"        // White
+                    };
+                    
+                    println!("{}[Packet {:>6}] {} ({:>3}) | Src: {:>15} | Dst: {:>15} | Size: {:>4} bytes{}", 
+                        color_code, packet_count, proto_name, protocol_num.0, 
+                        src_ip.to_string(), dst_ip.to_string(), 
+                        packet_size, "\x1b[0m");
+                        
+                    // Log suspicious patterns
+                    if packet_size == 0 {
+                        println!("\x1b[33m[!] Warning: Zero-length packet detected\x1b[0m");
+                    }
+                    if src_ip == dst_ip {
+                        println!("\x1b[33m[!] Warning: Source IP equals Destination IP\x1b[0m");
+                    }
                     match protocol_num {
                         IpNextHeaderProtocols::Tcp => {
                             if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
@@ -282,21 +411,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                if packet_count % 5 == 0 {
-                    println!("Processed {} packets...", packet_count);
+
+                // Show statistics every 5 seconds
+                if last_stats_time.elapsed().as_secs() >= 5 {
+                    let elapsed = last_stats_time.elapsed().as_secs_f64();
+                    let pps = packets_since_last_stats as f64 / elapsed;
+                    packets_per_second.push(pps);
+                    max_packet_rate = f64::max(max_packet_rate, pps);
+                    min_packet_rate = f64::min(min_packet_rate, pps);
+                    
+                    println!("\n\x1b[1m[Capture Statistics]\x1b[0m");
+                    println!("├─ Packet Summary:");
+                    println!("│  ├─ Total Processed: {}", packet_count);
+                    println!("│  ├─ Current Rate: {:.2} pkts/sec", pps);
+                    println!("│  ├─ Peak Rate: {:.2} pkts/sec", max_packet_rate);
+                    println!("│  ├─ Minimum Rate: {:.2} pkts/sec", min_packet_rate);
+                    println!("│  └─ Total Data: {:.2} MB", total_bytes as f64 / 1_048_576.0);
+                    
+                    println!("├─ Protocol Distribution:");
+                    for (proto, count) in &protocol_stats {
+                        let percentage = (*count as f64 / packet_count as f64) * 100.0;
+                        println!("│  ├─ {:<6}: {:>5} ({:.1}%)", proto, count, percentage);
+                    }
+                    
+                    println!("├─ Packet Sizes:");
+                    for (size, count) in &size_distribution {
+                        let percentage = (*count as f64 / packet_count as f64) * 100.0;
+                        println!("│  ├─ {:<20}: {:>5} ({:.1}%)", size, count, percentage);
+                    }
+                    
+                    println!("├─ Health Metrics:");
+                    println!("│  ├─ Capture Health: {:.1}%", capture_health);
+                    println!("│  └─ Dropped Packets: {} ({:.2}%)", 
+                        dropped_packets,
+                        (dropped_packets as f64 / packet_count as f64) * 100.0);
+                    
+                    println!("└─ System Status:");
+                    println!("   ├─ Uptime: {:.1} seconds", 
+                        std::time::Instant::now().duration_since(last_packet_time).as_secs_f64());
+                    println!("   └─ Memory Usage: {} packets in buffer", 
+                        packets_since_last_stats);
+                    
+                    packets_since_last_stats = 0;
+                    last_stats_time = std::time::Instant::now();
                 }
             }
             Err(e) => {
-                eprintln!("Error reading packet: {}", e);
+                eprintln!("\n[!] Error reading packet: {}", e);
+                dropped_packets += 1;
+                
                 if last_packet_time.elapsed().as_secs() > 10 {
-                    println!("Warning: No packets captured in the last 10 seconds. Check interface selection and permissions.");
+                    println!("\n[!] Warning: No packets captured in the last 10 seconds");
+                    println!("    Possible issues:");
+                    println!("    - Interface in wrong mode");
+                    println!("    - Insufficient permissions");
+                    println!("    - No traffic on interface");
+                    println!("    - Firewall blocking");
                     last_packet_time = std::time::Instant::now();
                 }
+                
+                // Small sleep to prevent CPU spinning on errors
+                std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
         }
     }
-    println!("\nCapture stopped. Exiting.");
+    
+    // Final statistics
+    println!("\n[Final Capture Statistics]");
+    println!("├─ Total Packets Processed: {}", packet_count);
+    println!("├─ Total Dropped Packets: {}", dropped_packets);
+    println!("└─ Total Runtime: {:.1} seconds", std::time::Instant::now().duration_since(last_packet_time).as_secs_f64());
+    
+    println!("\n[*] Capture stopped. Exiting.");
     Ok(())
 }
 
@@ -372,6 +559,9 @@ fn process_tcp_packet(
     // Save original IPs
     let orig_src_ip = features.src_ip.clone();
     let orig_dst_ip = features.dst_ip.clone();
+    
+    // Check if this is HTTP traffic
+    let is_http = features.src_port == 80 || features.dst_port == 80;
 
     // Encode categorical features before prediction
     if let Err(e) = model_predictor::apply_label_encoders(&mut features, "unified_ddos_best_model_metadata.pkl") {
@@ -388,9 +578,67 @@ fn process_tcp_packet(
                     println!("\n\x1b[36m=== Packet Analysis ===\x1b[0m");
                     println!("Source IP: \x1b[33m{}\x1b[0m", orig_src_ip);
                     println!("Destination IP: \x1b[33m{}\x1b[0m", orig_dst_ip);
-                    println!("Protocol: \x1b[33m{}\x1b[0m", features.protocol);
+                    
+                    // Identify common service ports
+                    let service_name = match (flow.src_port, flow.dst_port) {
+                        (80, _) | (_, 80) => " (HTTP)",
+                        (443, _) | (_, 443) => " (HTTPS)",
+                        (22, _) | (_, 22) => " (SSH)",
+                        (53, _) | (_, 53) => " (DNS)",
+                        (21, _) | (_, 21) => " (FTP)",
+                        (3306, _) | (_, 3306) => " (MySQL)",
+                        (27017, _) | (_, 27017) => " (MongoDB)",
+                        _ => ""
+                    };
+                    
+                    println!("Protocol: \x1b[33m{}{}\x1b[0m", features.protocol, service_name);
+                    println!("Ports: \x1b[33m{} → {}\x1b[0m", flow.src_port, flow.dst_port);
+                    println!("Flow Rate: \x1b[33m{:.2} pkts/sec\x1b[0m", features.flow_pkts_s);
                     println!("Prediction: {}{}\\x1b[0m (Confidence: {:.2}%)", 
-                             prediction_color, attack_type, confidence * 100.0);
+                        prediction_color, attack_type, confidence * 100.0);
+                    
+                    // Enhanced DDoS detection for all protocols
+                    let threshold = match (flow.src_port, flow.dst_port) {
+                        // Adjust thresholds based on protocol
+                        (80, _) | (_, 80) => 100.0,    // HTTP
+                        (443, _) | (_, 443) => 100.0,  // HTTPS
+                        (53, _) | (_, 53) => 200.0,    // DNS higher threshold
+                        _ => 150.0                      // Default threshold
+                    };
+
+                    if features.flow_pkts_s > threshold {
+                        println!("\n\x1b[31m⚠️  Potential DDoS Attack Indicators:\x1b[0m");
+                        println!("   • High packet rate: {:.2} packets/sec", features.flow_pkts_s);
+                        println!("   • Source IP: {}", orig_src_ip);
+                        
+                        // Protocol-specific checks
+                        match (flow.src_port, flow.dst_port) {
+                            (80, _) | (_, 80) | (443, _) | (_, 443) => {
+                                if features.syn_flag_cnt > 5 {
+                                    println!("   • High SYN count: {} (possible SYN flood)", features.syn_flag_cnt);
+                                }
+                            },
+                            (53, _) | (_, 53) => {
+                                if features.flow_byts_s > 10000.0 {
+                                    println!("   • High DNS traffic volume: {:.2} bytes/sec", features.flow_byts_s);
+                                }
+                            },
+                            _ => {
+                                if features.syn_flag_cnt > 3 {
+                                    println!("   • Elevated SYN count: {}", features.syn_flag_cnt);
+                                }
+                            }
+                        }
+                        
+                        // Common indicators for all protocols
+                        if features.flow_duration < 1.0 && features.tot_fwd_pkts > 10 {
+                            println!("   • Burst pattern: {} packets in {:.2}s", 
+                                features.tot_fwd_pkts, features.flow_duration);
+                        }
+                        if features.fwd_pkt_len_std < 1.0 && features.tot_fwd_pkts > 5 {
+                            println!("   • Uniform packet size detected (possible automated attack)");
+                        }
+                    }
 
                     // Check for potential DDoS if it's an attack
                     if attack_type != "BENIGN" {
@@ -415,17 +663,35 @@ fn process_tcp_packet(
                     features.label = prediction.clone();
                     flow.last_prediction = Some((prediction.clone(), confidence));
                     flow.prediction_count += 1;
-                    // Alert for potential DDoS
-                    if prediction.to_lowercase().contains("ddos") || 
-                       prediction.to_lowercase().contains("attack") {
-                        println!("⚠️  POTENTIAL DDOS DETECTED!");
+                    // Enhanced DDoS and Slowloris detection
+                    let is_ddos = prediction.to_lowercase().contains("ddos") || 
+                                 prediction.to_lowercase().contains("attack");
+                    
+                    // Slowloris pattern detection
+                    let is_slowloris = features.flow_duration < 0.01 && // Very short flows
+                        features.tot_fwd_pkts == 1 && // Single packet flows
+                        features.tot_bwd_pkts == 0 && // No response packets
+                        features.flow_byts_s > 100000.0 && // High byte rate
+                        features.protocol == 6; // TCP protocol
+                    
+                    if is_ddos || is_slowloris {
+                        let attack_type = if is_slowloris {
+                            "SLOWLORIS"
+                        } else {
+                            &prediction
+                        };
+                        
+                        println!("\n\x1b[31m⚠️  POTENTIAL {} ATTACK DETECTED!\x1b[0m", attack_type);
                         println!("   Flow: {}:{} -> {}:{}", 
                                 orig_src_ip, features.src_port,
                                 orig_dst_ip, features.dst_port);
                         println!("   Prediction: {} (Confidence: {:.2}%)", 
-                                prediction, confidence * 100.0);
-                        println!("   Flow Stats: {} fwd, {} bwd packets", 
+                                attack_type, confidence * 100.0);
+                        println!("   Flow Stats:");
+                        println!("     - Packets: {} forward, {} backward", 
                                 features.tot_fwd_pkts, features.tot_bwd_pkts);
+                        println!("     - Bytes/sec: {:.2}", features.flow_byts_s);
+                        println!("     - Flow Duration: {:.6}s", features.flow_duration);
                     }
                 }
                 Err(e) => {
@@ -444,13 +710,21 @@ fn process_tcp_packet(
     writer.serialize(&features)?;
     writer.flush()?;
 
-    // Print normal flow progress
-    if total_packets % 20 == 0 {
-        println!("TCP Flow: {}:{} -> {}:{} [Fwd: {}, Bwd: {}, Pred: {}]",
+    // Print normal flow progress and check for HTTP DDoS patterns
+    if total_packets % 20 == 0 || is_http {
+        println!("TCP Flow: {}:{} -> {}:{} [Fwd: {}, Bwd: {}, Pred: {}]{}",
             features.src_ip, features.src_port,
             features.dst_ip, features.dst_port,
             features.tot_fwd_pkts, features.tot_bwd_pkts,
-            features.label);
+            features.label,
+            if is_http { " [HTTP Traffic]" } else { "" });
+            
+        // Additional DDoS detection for HTTP
+        if is_http && features.flow_pkts_s > 100.0 {  // More than 100 packets per second
+            println!("⚠️  Potential HTTP DDoS Attack Detected!");
+            println!("   Flow Rate: {:.2} packets/sec", features.flow_pkts_s);
+            println!("   Source IP: {}", features.src_ip);
+        }
     }
 
     Ok(())
@@ -520,6 +794,19 @@ fn process_udp_packet(
     let orig_src_ip = features.src_ip.clone();
     let orig_dst_ip = features.dst_ip.clone();
 
+    // Get protocol-specific packet rate threshold
+    let packet_rate_threshold = match (features.src_port, features.dst_port) {
+        (53, _) | (_, 53) => 200.0,    // DNS queries - higher threshold
+        (123, _) | (_, 123) => 50.0,   // NTP traffic
+        (1900, _) | (_, 1900) => 30.0, // SSDP traffic
+        (137, _) | (_, 137) => 40.0,   // NetBIOS
+        (389, _) | (_, 389) => 60.0,   // LDAP
+        (11211, _) | (_, 11211) => 45.0, // Memcached
+        _ => 100.0,                    // Default threshold
+    };
+
+    // Attack patterns are checked in the match statement during prediction
+
     // Encode categorical features before prediction
     if let Err(e) = model_predictor::apply_label_encoders(&mut features, "unified_ddos_best_model_metadata.pkl") {
         eprintln!("Label encoding error: {}", e);
@@ -533,15 +820,176 @@ fn process_udp_packet(
                     features.label = prediction.clone();
                     flow.last_prediction = Some((prediction.clone(), confidence));
                     flow.prediction_count += 1;
-                    // Alert for potential DDoS
-                    if prediction.to_lowercase().contains("ddos") || 
-                       prediction.to_lowercase().contains("attack") {
-                        println!("⚠️  POTENTIAL DDOS DETECTED!");
-                        println!("   UDP Flow: {}:{} -> {}:{}", 
-                                orig_src_ip, features.src_port,
-                                orig_dst_ip, features.dst_port);
-                        println!("   Prediction: {} (Confidence: {:.2}%)", 
-                                prediction, confidence * 100.0);
+
+                    // Specific attack type detection based on model predictions and traffic patterns
+                    let attack_type = match prediction.as_str() {
+                        "DNS" => {
+                            if (features.src_port == 53 || features.dst_port == 53) && 
+                               features.bwd_pkt_len_mean > 512.0 {
+                                Some(("DNS Amplification", "\x1b[31m"))
+                            } else {
+                                None
+                            }
+                        },
+                        "NTP" => {
+                            if (features.src_port == 123 || features.dst_port == 123) && 
+                               features.flow_byts_s > 100000.0 {
+                                Some(("NTP Amplification", "\x1b[31m"))
+                            } else {
+                                None
+                            }
+                        },
+                        "HTTP" => {
+                            if features.protocol == 6 && 
+                               (features.src_port == 80 || features.dst_port == 80) {
+                                Some(("HTTP Flood", "\x1b[33m"))
+                            } else {
+                                None
+                            }
+                        },
+                        "LDAP" => {
+                            if (features.src_port == 389 || features.dst_port == 389) && 
+                               features.bwd_pkt_len_mean > 1000.0 {
+                                Some(("LDAP Amplification", "\x1b[31m"))
+                            } else {
+                                None
+                            }
+                        },
+                        "MSSQL" => {
+                            if (features.src_port == 1433 || features.dst_port == 1433 ||
+                                features.protocol == 90) && // MSSQL TDS protocol
+                               features.flow_byts_s > 100000.0 && // High byte rate
+                               features.tot_fwd_pkts >= 1 && // At least one forward packet
+                               features.fwd_pkt_len_mean > 1000.0 // Large packets
+                            {
+                                Some(("MSSQL Attack", "\x1b[35m"))
+                            } else {
+                                None
+                            }
+                        },
+                        "NetBIOS" => {
+                            if features.src_port == 137 || features.dst_port == 137 && 
+                               features.flow_pkts_s > 40.0 {
+                                Some(("NetBIOS Attack", "\x1b[33m"))
+                            } else {
+                                None
+                            }
+                        },
+                        "Portmap" => {
+                            if features.src_port == 111 || features.dst_port == 111 {
+                                Some(("Portmap Attack", "\x1b[35m"))
+                            } else {
+                                None
+                            }
+                        },
+                        "Slowloris" => {
+                            if features.protocol == 6 && 
+                               (features.src_port == 80 || features.dst_port == 80 || 
+                                features.src_port == 443 || features.dst_port == 443) &&
+                               // Slowloris characteristics:
+                               features.flow_duration < 1.0 && // Short initial connections
+                               features.fwd_pkt_len_mean < 200.0 && // Small packets
+                               features.flow_pkts_s < 100.0 && // Lower packet rate
+                               features.tot_fwd_pkts <= 2 // Few packets per flow
+                            {
+                                Some(("Slowloris Attack", "\x1b[36m"))
+                            } else {
+                                None
+                            }
+                        },
+                        "RECURSIVE_GET" => {
+                            if features.protocol == 6 && 
+                               (features.src_port == 80 || features.dst_port == 80) &&
+                               features.flow_pkts_s > 50.0 {
+                                Some(("Recursive GET Attack", "\x1b[33m"))
+                            } else {
+                                None
+                            }
+                        },
+                        "SLOW_POST" => {
+                            if features.protocol == 6 && 
+                               (features.src_port == 80 || features.dst_port == 80) &&
+                               features.flow_duration > 8.0 &&
+                               features.fwd_pkt_len_mean < 200.0 {
+                                Some(("Slow POST Attack", "\x1b[36m"))
+                            } else {
+                                None
+                            }
+                        },
+                        "SYN" => {
+                            if features.protocol == 6 && 
+                               features.syn_flag_cnt > 0 &&
+                               features.flow_pkts_s > 100.0 {
+                                Some(("SYN Flood Attack", "\x1b[31m"))
+                            } else {
+                                None
+                            }
+                        },
+                        "UDP" | "UDPLag" => {
+                            if features.protocol == 17 && 
+                               features.flow_pkts_s > packet_rate_threshold {
+                                Some(("UDP Flood Attack", "\x1b[31m"))
+                            } else {
+                                None
+                            }
+                        },
+                        _ => None
+                    };
+
+                    // Attack detection patterns are now handled in the match statement above
+
+                    if let Some((attack_name, color)) = attack_type {
+                        // Print attack detection alert with specific details
+                        println!("\n{}⚠️  {} Detected!\x1b[0m", color, attack_name);
+                        
+                        // Basic flow information
+                        println!("   Flow Details:");
+                        println!("   ├─ Protocol: {}{}", 
+                            if features.protocol == 6 { "TCP" } else { "UDP" },
+                            match (features.src_port, features.dst_port) {
+                                (80, _) | (_, 80) => " (HTTP)",
+                                (443, _) | (_, 443) => " (HTTPS)",
+                                (53, _) | (_, 53) => " (DNS)",
+                                (123, _) | (_, 123) => " (NTP)",
+                                (389, _) | (_, 389) => " (LDAP)",
+                                (1433, _) | (_, 1433) => " (MSSQL)",
+                                (137, _) | (_, 137) => " (NetBIOS)",
+                                (111, _) | (_, 111) => " (Portmap)",
+                                _ => ""
+                            }
+                        );
+                        println!("   ├─ Source: {}:{}", orig_src_ip, features.src_port);
+                        println!("   └─ Destination: {}:{}", orig_dst_ip, features.dst_port);
+                        
+                        // Attack-specific metrics
+                        println!("   Attack Metrics:");
+                        println!("   ├─ Packet Rate: {:.2} pkts/sec", features.flow_pkts_s);
+                        println!("   ├─ Byte Rate: {:.2} bytes/sec", features.flow_byts_s);
+                        println!("   ├─ Flow Duration: {:.2}s", features.flow_duration);
+                        println!("   ├─ Packets: {} forward, {} backward", 
+                            features.tot_fwd_pkts, features.tot_bwd_pkts);
+                        println!("   ├─ Avg Packet Size: {:.2} bytes", features.pkt_len_mean);
+                        println!("   └─ Inter-arrival Time: {:.3}s", features.fwd_iat_mean);
+
+                        // Model confidence
+                        println!("   Model Confidence: {:.2}%", confidence * 100.0);
+                        // Protocol-specific warnings based on packet patterns
+                        let protocol_warning = match (features.protocol, features.src_port, features.dst_port) {
+                            (17, 53, _) | (17, _, 53) if features.flow_pkts_s > 200.0 => 
+                                Some("High DNS query rate detected - Possible DNS amplification attack"),
+                            (17, 123, _) | (17, _, 123) if features.flow_byts_s > 10000.0 => 
+                                Some("High NTP traffic volume - Possible NTP amplification attack"),
+                            (17, 1900, _) | (17, _, 1900) if features.pkt_len_mean > 1000.0 => 
+                                Some("Large SSDP packets detected - Possible SSDP amplification attack"),
+                            _ => None
+                        };
+
+                        // Print any protocol-specific warnings
+                        if let Some(warning) = protocol_warning {
+                            println!("   \x1b[33m⚠ {}\x1b[0m", warning);
+                        }
+
+                        println!("\x1b[36m{}\x1b[0m", "-".repeat(50));
                     }
                 }
                 Err(e) => {
@@ -634,8 +1082,15 @@ fn process_generic_packet(
     let orig_src_ip = features.src_ip.clone();
     let orig_dst_ip = features.dst_ip.clone();
 
-    // Debug: Print generic packet info
-    println!("[Generic] Protocol: {} | Src: {} | Dst: {} | Total packets: {}", features.protocol, orig_src_ip, orig_dst_ip, flow.fwd_packets.len() + flow.bwd_packets.len());
+    // Protocol-specific thresholds and detection
+    let (protocol_name, base_threshold) = match protocol_num {
+        1 => ("ICMP", 50.0),      // ICMP has lower normal traffic rates
+        47 => ("GRE", 150.0),     // GRE tunnel traffic
+        50 => ("ESP", 200.0),     // IPSec encrypted traffic
+        51 => ("AH", 200.0),      // IPSec authentication
+        58 => ("ICMPv6", 50.0),   // ICMPv6 traffic
+        _ => ("Unknown", 100.0),   // Default threshold for other protocols
+    };
 
     // Encode categorical features before prediction
     if let Err(e) = model_predictor::apply_label_encoders(&mut features, "unified_ddos_best_model_metadata.pkl") {
@@ -650,15 +1105,36 @@ fn process_generic_packet(
                     features.label = prediction.clone();
                     flow.last_prediction = Some((prediction.clone(), confidence));
                     flow.prediction_count += 1;
-                    println!("[Prediction] Label: {} | Confidence: {:.2}%", prediction, confidence * 100.0);
-                    // Alert for potential DDoS
-                    if prediction.to_lowercase().contains("ddos") || 
-                       prediction.to_lowercase().contains("attack") {
-                        println!("⚠️  POTENTIAL DDOS DETECTED!");
-                        println!("   Generic Flow: {} -> {} ({})", 
-                                orig_src_ip, orig_dst_ip, features.protocol);
-                        println!("   Prediction: {} (Confidence: {:.2}%)", 
-                                prediction, confidence * 100.0);
+
+                    // Enhanced detection logic
+                    let is_attack = prediction.to_lowercase().contains("ddos") || 
+                                  prediction.to_lowercase().contains("attack");
+                    let high_rate = features.flow_pkts_s > base_threshold;
+                    let burst_pattern = features.flow_duration < 1.0 && features.tot_fwd_pkts > 20;
+                    
+                    if is_attack || high_rate || burst_pattern {
+                        println!("\n\x1b[31m⚠️  Potential {} DDoS Attack Detected!\x1b[0m", protocol_name);
+                        println!("   Flow: {} → {}", orig_src_ip, orig_dst_ip);
+                        println!("   Protocol: {} ({})", protocol_name, protocol_num);
+                        println!("   Packet Rate: {:.2} pkts/sec (Threshold: {:.2})", 
+                            features.flow_pkts_s, base_threshold);
+                        println!("   Total Packets: {} (Fwd: {}, Bwd: {})",
+                            total_packets, features.tot_fwd_pkts, features.tot_bwd_pkts);
+                        println!("   Flow Duration: {:.2}s", features.flow_duration);
+                        println!("   Model Prediction: {} (Confidence: {:.2}%)", 
+                            prediction, confidence * 100.0);
+
+                        // Protocol-specific warnings
+                        if protocol_num == 1 && features.flow_pkts_s > 100.0 {
+                            println!("   \x1b[33m⚠ High ICMP rate - Possible ICMP flood attack\x1b[0m");
+                        }
+                        if burst_pattern {
+                            println!("   \x1b[33m⚠ Burst pattern detected - Possible flood attack\x1b[0m");
+                        }
+                        if features.pkt_len_std < 1.0 && total_packets > 10 {
+                            println!("   \x1b[33m⚠ Uniform packet size - Possible automated attack\x1b[0m");
+                        }
+                        println!("\x1b[36m{}\x1b[0m", "-".repeat(50));
                     }
                 }
                 Err(e) => {
@@ -897,6 +1373,38 @@ fn calculate_std_dev_f64(values: &[f64], mean: f64) -> f64 {
     variance.sqrt()
 }
 
+fn verify_packet(ipv4: &Ipv4Packet) -> bool {
+    // Verify IP header checksum
+    let header_len = ipv4.get_header_length() as usize * 4;
+    if header_len < 20 || header_len > ipv4.packet().len() {
+        return false;
+    }
+
+    // Verify total length
+    let total_length = ipv4.get_total_length() as usize;
+    if total_length < header_len || total_length > ipv4.packet().len() {
+        return false;
+    }
+
+    // Verify IP version
+    if ipv4.get_version() != 4 {
+        return false;
+    }
+
+    // Verify source and destination addresses
+    let src_ip = ipv4.get_source();
+    let dst_ip = ipv4.get_destination();
+    
+    // Check for invalid IP addresses
+    if src_ip.is_unspecified() || src_ip.is_broadcast() || 
+       dst_ip.is_unspecified() || 
+       (src_ip.is_loopback() && !dst_ip.is_loopback()) {
+        return false;
+    }
+
+    true
+}
+
 fn calculate_tcp_flags(
     fwd_packets: &VecDeque<PacketData>,
     bwd_packets: &VecDeque<PacketData>,
@@ -912,21 +1420,21 @@ fn calculate_tcp_flags(
     const ECE: u8 = 0x40;
     const CWR: u8 = 0x80;
     
-    let mut fin_count = 0;
-    let mut syn_count = 0;
-    let mut rst_count = 0;
-    let mut psh_count = 0;
-    let mut ack_count = 0;
-    let mut urg_count = 0;
-    let mut ece_count = 0;
-    let mut cwr_count = 0;
+    let mut fin_count = 0u8;
+    let mut syn_count = 0u8;
+    let mut rst_count = 0u8;
+    let mut psh_count = 0u8;
+    let mut ack_count = 0u8;
+    let mut urg_count = 0u8;
+    let mut ece_count = 0u8;
+    let mut cwr_count = 0u8;
     
-    let mut fwd_psh_count = 0;
-    let mut fwd_urg_count = 0;
-    let mut bwd_psh_count = 0;
-    let mut bwd_urg_count = 0;
-    
-    // Count forward flags
+    let mut fwd_psh_count = 0u8;
+    let mut fwd_urg_count = 0u8;
+    let mut bwd_psh_count = 0u8;
+    let mut bwd_urg_count = 0u8;
+
+    // Process forward packets
     for packet in fwd_packets {
         if let Some(flags) = packet.tcp_flags {
             if flags & FIN != 0 { fin_count += 1; }
@@ -939,8 +1447,8 @@ fn calculate_tcp_flags(
             if flags & CWR != 0 { cwr_count += 1; }
         }
     }
-    
-    // Count backward flags
+
+    // Process backward packets
     for packet in bwd_packets {
         if let Some(flags) = packet.tcp_flags {
             if flags & FIN != 0 { fin_count += 1; }
@@ -953,7 +1461,8 @@ fn calculate_tcp_flags(
             if flags & CWR != 0 { cwr_count += 1; }
         }
     }
-    
+
+    // Update feature struct with collected flags
     features.fin_flag_cnt = fin_count;
     features.syn_flag_cnt = syn_count;
     features.rst_flag_cnt = rst_count;
@@ -967,6 +1476,7 @@ fn calculate_tcp_flags(
     features.fwd_urg_flags = fwd_urg_count;
     features.bwd_psh_flags = bwd_psh_count;
     features.bwd_urg_flags = bwd_urg_count;
+
 }
 
 fn calculate_bulk_features(
@@ -979,15 +1489,21 @@ fn calculate_bulk_features(
     let bwd_bulk_packets = bwd_packets.len() as f64;
     
     if fwd_bulk_packets > 0.0 {
-        features.fwd_byts_b_avg = features.totlen_fwd_pkts as f64 / fwd_bulk_packets;
+        let total_fwd_bytes: u32 = fwd_packets.iter()
+            .map(|p| p.payload_len as u32)
+            .sum();
+        features.fwd_byts_b_avg = total_fwd_bytes as f64 / fwd_bulk_packets;
         features.fwd_pkts_b_avg = fwd_bulk_packets;
-        features.fwd_blk_rate_avg = fwd_bulk_packets / features.flow_duration.max(1.0);
+        features.fwd_blk_rate_avg = features.fwd_byts_b_avg / features.flow_duration.max(1.0);
     }
     
     if bwd_bulk_packets > 0.0 {
-        features.bwd_byts_b_avg = features.totlen_bwd_pkts as f64 / bwd_bulk_packets;
+        let total_bwd_bytes: u32 = bwd_packets.iter()
+            .map(|p| p.payload_len as u32)
+            .sum();
+        features.bwd_byts_b_avg = total_bwd_bytes as f64 / bwd_bulk_packets;
         features.bwd_pkts_b_avg = bwd_bulk_packets;
-        features.bwd_blk_rate_avg = bwd_bulk_packets / features.flow_duration.max(1.0);
+        features.bwd_blk_rate_avg = features.bwd_byts_b_avg / features.flow_duration.max(1.0);
     }
     
     // Calculate active and idle time statistics
@@ -1007,38 +1523,54 @@ fn calculate_active_idle_stats(
         return;
     }
     
+    const ACTIVE_TIMEOUT: f64 = 1.0; // 1 second timeout for active period
+    const IDLE_TIMEOUT: f64 = 5.0;  // 5 second timeout for idle period
+    
     let mut active_periods = Vec::new();
     let mut idle_periods = Vec::new();
+    let mut current_active_start = all_packets[0].timestamp;
+    let mut last_packet_time = all_packets[0].timestamp;
     
-    // Simple heuristic: periods with < 1 second between packets are "active"
-    let active_threshold = Duration::from_secs(1);
-    
-    for window in all_packets.windows(2) {
-        if let [prev, curr] = window {
-            if let Ok(duration) = curr.timestamp.duration_since(prev.timestamp) {
-                let duration_secs = duration.as_secs_f64();
-                if duration <= active_threshold {
-                    active_periods.push(duration_secs);
-                } else {
-                    idle_periods.push(duration_secs);
+    for packet in all_packets.iter().skip(1) {
+        if let Ok(idle_time) = packet.timestamp.duration_since(last_packet_time) {
+            let idle_secs = idle_time.as_secs_f64();
+            
+            if idle_secs > ACTIVE_TIMEOUT {
+                // End of active period
+                if let Ok(active_duration) = last_packet_time.duration_since(current_active_start) {
+                    active_periods.push(active_duration.as_secs_f64());
                 }
+                
+                if idle_secs > IDLE_TIMEOUT {
+                    idle_periods.push(idle_secs);
+                }
+                
+                current_active_start = packet.timestamp;
             }
         }
+        last_packet_time = packet.timestamp;
+    }
+    
+    // Add final active period
+    if let Ok(final_active) = last_packet_time.duration_since(current_active_start) {
+        active_periods.push(final_active.as_secs_f64());
     }
     
     // Calculate active time statistics
     if !active_periods.is_empty() {
-        features.active_max = active_periods.iter().fold(0.0, |a, &b| a.max(b));
-        features.active_min = active_periods.iter().fold(f64::MAX, |a, &b| a.min(b));
+        features.active_max = *active_periods.iter().max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(&0.0);
+        features.active_min = *active_periods.iter().min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(&0.0);
         features.active_mean = active_periods.iter().sum::<f64>() / active_periods.len() as f64;
         features.active_std = calculate_std_dev_f64(&active_periods, features.active_mean);
     }
     
     // Calculate idle time statistics
     if !idle_periods.is_empty() {
-        features.idle_max = idle_periods.iter().fold(0.0, |a, &b| a.max(b));
-        features.idle_min = idle_periods.iter().fold(f64::MAX, |a, &b| a.min(b));
+        features.idle_max = *idle_periods.iter().max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(&0.0);
+        features.idle_min = *idle_periods.iter().min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(&0.0);
         features.idle_mean = idle_periods.iter().sum::<f64>() / idle_periods.len() as f64;
         features.idle_std = calculate_std_dev_f64(&idle_periods, features.idle_mean);
     }
+    
+
 }
