@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 pub struct DDoSDetector {
-    // Track requests per IP
+
     ip_requests: HashMap<String, Vec<SystemTime>>,
-    // Configuration
+
     time_window: Duration,
     threshold: usize,
 }
@@ -21,11 +21,9 @@ impl DDoSDetector {
     pub fn check_ip(&mut self, ip: &str, attack_type: &str) -> Option<String> {
         let now = SystemTime::now();
         let requests = self.ip_requests.entry(ip.to_string()).or_insert_with(Vec::new);
-        
-        // Add new request
+
         requests.push(now);
-        
-        // Remove old requests outside the time window
+
         requests.retain(|&time| {
             if let Ok(elapsed) = time.elapsed() {
                 elapsed <= self.time_window
@@ -34,15 +32,14 @@ impl DDoSDetector {
             }
         });
 
-        // Check if number of requests exceeds threshold
         if requests.len() >= self.threshold {
             Some(format!(
                 "\x1b[31mALERT: Potential DDoS Attack detected!\x1b[0m\n\
                 Source IP: {}\n\
                 Attack Type: {}\n\
                 Requests in last {} seconds: {}\n\
-                Current Threshold: {}", 
-                ip, 
+                Current Threshold: {}",
+                ip,
                 attack_type,
                 self.time_window.as_secs(),
                 requests.len(),
